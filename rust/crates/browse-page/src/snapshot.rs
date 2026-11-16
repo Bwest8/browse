@@ -603,6 +603,21 @@ async fn settle_recent_navigation(page: &Arc<TabPage>, deadline: Instant) {
     }
 }
 
+/// `find` searches the captured outline. The outline otherwise keeps only the highest-priority
+/// `maxItems` lines, so a search that ran afterward would miss text that was on the page. A search
+/// captures at least this many lines, then filters.
+const FIND_SCAN_ITEMS: i64 = 1_000;
+
+/// `(max_items, max_candidates)` passed to the page capture.
+fn capture_limits(max_items: i64, finding: bool) -> (i64, i64) {
+    if finding {
+        let items = max_items.max(FIND_SCAN_ITEMS);
+        (items, items)
+    } else {
+        (max_items, (max_items * 20).max(1_000))
+    }
+}
+
 /// The compact snapshot; registers refs in the tab's state.
 pub async fn snapshot(page: &Arc<TabPage>, tab_state: &PageTab, options: &Options) -> Result<String> {
     if options.aria {
@@ -613,7 +628,7 @@ pub async fn snapshot(page: &Arc<TabPage>, tab_state: &PageTab, options: &Option
         bail!("snapshot accepts either diff or delta, not both");
     }
     let scope = resolve_scope(page, tab_state, options).await?;
-    let max_items = options.max_items;
+    let (max_items, max_candidates) = capture_limits(options.max_items, options.find.is_some());
     let deadline = Instant::now() + Duration::from_millis(options.timeout_ms);
     let (root_selector, root_role, root_name) = match &scope.settings_root {
         Some((selector, role, name)) => (Some(selector.clone()), role.clone(), name.clone()),
@@ -623,7 +638,7 @@ pub async fn snapshot(page: &Arc<TabPage>, tab_state: &PageTab, options: &Option
         compact: options.compact,
         depth: options.depth,
         interactive: options.interactive,
-        max_candidates: (max_items * 20).max(1_000),
+        max_candidates,
         max_items,
         root_selector,
         root_role,
@@ -635,7 +650,8 @@ pub async fn snapshot(page: &Arc<TabPage>, tab_state: &PageTab, options: &Option
         "depth": settings.depth,
         "interactive": settings.interactive,
         "frames": options.frames,
-        "maxItems": settings.max_items,
+        // The caller's maxItems, not the larger budget a `find` uses to scan. Diff stays comparable.
+        "maxItems": options.max_items,
         "scope": scope.signature,
     })
     .to_string();
@@ -1104,6 +1120,14 @@ mod tests {
         assert!(ops.contains(&DiffOp::Removed(entry("- b"))));
         assert!(ops.contains(&DiffOp::Added(entry("  - d"))));
         assert_eq!(format_diff_line('+', &entry("  - d"), Some("e4")), "+   d [ref=e4]");
+    }
+
+    #[test]
+    fn find_scans_past_the_outline_cap() {
+        assert_eq!(capture_limits(20, false), (20, 1_000));
+        assert_eq!(capture_limits(80, false), (80, 1_600));
+        assert_eq!(capture_limits(20, true), (FIND_SCAN_ITEMS, FIND_SCAN_ITEMS));
+        assert_eq!(capture_limits(FIND_SCAN_ITEMS + 50, true), (FIND_SCAN_ITEMS + 50, FIND_SCAN_ITEMS + 50));
     }
 
     #[test]

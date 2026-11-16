@@ -66,6 +66,39 @@ RUNNING
                               It prints the tab it ended in; --tab <id> continues there
 ";
 
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+fn is_builtin(command: &str) -> bool {
+    matches!(
+        command,
+        "serve" | "mcp" | "install" | "uninstall" | "set" | "restart" | "pair" | "extension" | "update" | "status" | "runtime-switch" | "tools" | "version"
+    )
+}
+
+/// The help lines for one built-in command, taken from `HELP`.
+fn command_help(command: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut taking = false;
+    for line in HELP.lines() {
+        let header = line.starts_with("  ") && !line.starts_with("    ") && !line.trim().is_empty();
+        if header {
+            if taking {
+                break;
+            }
+            let name = line.trim().split_whitespace().next().unwrap_or("");
+            if name == command {
+                taking = true;
+            }
+        }
+        if taking {
+            out.push(line);
+        }
+    }
+    if out.is_empty() { None } else { Some(out.join("\n")) }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Global flags may come before the tool name: `browse --tab 12 snapshot`.
@@ -88,6 +121,14 @@ fn main() {
         }
     }
     let rest = args.get(1..).unwrap_or_default();
+    // `browse restart --help` must print help. It must not restart the relay.
+    if wants_help(rest) && is_builtin(command) {
+        match command_help(command) {
+            Some(text) => println!("{text}"),
+            None => println!("browse {command}\n\nRun `browse --help` for the command list."),
+        }
+        std::process::exit(0);
+    }
     let result = match command {
         "--help" | "-h" | "help" => {
             print!("{HELP}");
@@ -124,4 +165,23 @@ fn main() {
         1
     });
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_flag_does_not_select_a_command_body() {
+        assert!(wants_help(&["--help".into()]));
+        assert!(wants_help(&["--check".into(), "--help".into()]));
+        assert!(!wants_help(&["--check".into()]));
+        let restart = command_help("restart").unwrap();
+        assert!(restart.contains("Restart the relay"));
+        assert!(!restart.contains("install"));
+        assert!(command_help("install").unwrap().contains("--no-wait"));
+        assert!(command_help("not-a-command").is_none());
+        assert!(is_builtin("restart"));
+        assert!(!is_builtin("snapshot"));
+    }
 }

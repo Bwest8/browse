@@ -133,6 +133,14 @@ fn kinds(schema: &Value) -> Vec<String> {
     out
 }
 
+fn boolean_word(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn matches(schema: &Value, value: &Value) -> bool {
     variants(schema).into_iter().any(|variant| {
         let kinds = types(variant);
@@ -204,12 +212,13 @@ pub fn split_globals(args: &[String]) -> (Vec<String>, Vec<String>) {
     (globals, args[i..].to_vec())
 }
 
-pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
-    let specs = relay::specs(None);
-    let Some(spec) = specs.iter().find(|s| s.name == name).or_else(|| specs.iter().find(|s| s.name == name.replace('-', "_"))) else {
-        eprintln!("Unknown command or tool: {name}. Run `browse --help`.");
-        return Ok(2);
-    };
+struct Parsed {
+    arguments: Map<String, Value>,
+    output: Option<PathBuf>,
+    help: bool,
+}
+
+fn parse_tool_args(spec: &ToolSpec, args: &[String]) -> anyhow::Result<Parsed> {
     let name = spec.name.as_str();
     let properties = properties(spec);
     let resolve = |flag: &str| -> anyhow::Result<String> {
@@ -242,8 +251,7 @@ pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
         };
         match flag {
             "help" | "h" => {
-                help(spec);
-                return Ok(0);
+                return Ok(Parsed { arguments: Map::new(), output: None, help: true });
             }
             // `browse execute --file script.js` (or `-` for stdin).
             "file" if name == "execute" && !properties.contains_key("file") => {
@@ -278,27 +286,53 @@ pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
                 let key = resolve(flag)?;
                 let schema = &properties[&key];
                 let boolean = kinds(schema) == ["boolean"];
-                let value = match inline.or_else(|| if boolean { None } else { take(&mut i) }) {
-                    None if boolean => Value::Bool(true),
-                    None => bail!("--{flag} needs a value; see `browse {name} --help`"),
-                    Some(raw) => coerce(flag, schema, raw)?,
+                // `--compact false` is a value. A bare `--compact` stays true. The next word is left alone
+                // unless it is true or false, so it can still fill a positional.
+                let value = if let Some(raw) = inline {
+                    coerce(flag, schema, raw)?
+                } else if boolean && let Some(word) = args.get(i).and_then(|next| boolean_word(next)) {
+                    i += 1;
+                    Value::Bool(word)
+                } else if boolean {
+                    Value::Bool(true)
+                } else {
+                    match take(&mut i) {
+                        Some(raw) => coerce(flag, schema, raw)?,
+                        None => bail!("--{flag} needs a value; see `browse {name} --help`"),
+                    }
                 };
                 arguments.insert(key, value);
             }
         }
+    }
+    if let Some(tab) = tab {
+        if !properties.contains_key("tab") {
+            bail!("{name} doesn't act on a tab; leave out --tab");
+        }
+        // Fill tab before positionals, so a leftover word is not parsed as the tab id.
+        arguments.insert("tab".into(), Value::from(tab));
     }
     for value in positional {
         let key = slot(spec, &arguments, &value).with_context(|| format!("unexpected argument {value:?}; see `browse {name} --help`"))?;
         let parsed = coerce(&key, &properties[&key], value)?;
         arguments.insert(key, parsed);
     }
-    if let Some(tab) = tab {
-        if !properties.contains_key("tab") {
-            bail!("{name} doesn't act on a tab; leave out --tab");
-        }
-        arguments.insert("tab".into(), Value::from(tab));
-    }
     check(name, &properties, &arguments)?;
+    Ok(Parsed { arguments, output, help: false })
+}
+
+pub fn call(name: &str, args: &[String]) -> anyhow::Result<i32> {
+    let specs = relay::specs(None);
+    let Some(spec) = specs.iter().find(|s| s.name == name).or_else(|| specs.iter().find(|s| s.name == name.replace('-', "_"))) else {
+        eprintln!("Unknown command or tool: {name}. Run `browse --help`.");
+        return Ok(2);
+    };
+    let name = spec.name.as_str();
+    let Parsed { arguments, output, help: show_help } = parse_tool_args(spec, args)?;
+    if show_help {
+        help(spec);
+        return Ok(0);
+    }
     if let Some(dir) = output.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("can't create {} for --output", dir.display()))?;
     }
@@ -371,6 +405,27 @@ mod tests {
         let choice = json!({ "type": "string", "enum": ["load", "settle"] });
         assert!(coerce("waitUntil", &choice, "soon".into()).is_err());
         assert!(coerce("flag", &json!({ "type": "boolean" }), "maybe".into()).is_err());
+        assert_eq!(boolean_word("false"), Some(false));
+        assert_eq!(boolean_word("true"), Some(true));
+        assert_eq!(boolean_word("NFL"), None);
+    }
+
+    #[test]
+    fn boolean_false_is_not_the_tab_id() {
+        let snapshot = spec(json!({
+            "properties": {
+                "tab": { "type": "integer" },
+                "compact": { "type": "boolean" },
+                "find": { "type": "string" }
+            },
+            "required": ["tab"]
+        }));
+        let args: Vec<String> = ["--tab", "12", "--find", "NFL", "--compact", "false"].map(String::from).to_vec();
+        let parsed = parse_tool_args(&snapshot, &args).unwrap();
+        assert_eq!(parsed.arguments["tab"], json!(12));
+        assert_eq!(parsed.arguments["compact"], json!(false));
+        assert_eq!(parsed.arguments["find"], json!("NFL"));
+        assert!(!parsed.help);
     }
 
     #[test]
