@@ -16,7 +16,7 @@ use crate::human::Point;
 use crate::input::{Input, Interrupted};
 use crate::eval;
 use crate::navigation::{self, NavResult, WaitUntil};
-use crate::page::{Arg, DialogPolicy, ElementOr, TabPage, truncate, v};
+use crate::page::{Arg, DialogPolicy, ElementOr, TabEvent, TabPage, truncate, v};
 use crate::snapshot;
 use crate::state::{self, PageTab};
 use crate::target::{self, ResolveOptions, Spec};
@@ -323,6 +323,24 @@ async fn snapshot_tool(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
 
 // click / hover
 
+/// A click on a link should report the page it opened. `describe` returns `link "Name"` or `link`.
+fn follows_navigation(label: &str) -> bool {
+    label == "link" || label.starts_with("link ")
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::follows_navigation;
+
+    #[test]
+    fn only_links_wait_for_navigation() {
+        assert!(follows_navigation("link"));
+        assert!(follows_navigation("link \"NFL\""));
+        assert!(!follows_navigation("button \"Save\""));
+        assert!(!follows_navigation("listbox"));
+    }
+}
+
 async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     let c = open(&ctx, &args).await?;
     let spec = Spec::from_args(&args);
@@ -330,6 +348,7 @@ async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
     if spec.is_none() && point.is_none() {
         bail!("click needs a ref, a selector, or x and y");
     }
+    let mut follow = false;
     let button = str_arg(&args, "button").unwrap_or("left").to_string();
     if !matches!(button.as_str(), "left" | "right" | "middle") {
         bail!("button must be left, right or middle");
@@ -343,6 +362,7 @@ async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
             let at = match (&spec, point) {
                 (Some(spec), _) => {
                     let (resolved, at) = actions::locate(&c.page, &c.tab_state, input, spec, options).await?;
+                    follow = follows_navigation(&resolved.label);
                     out.insert("clicked".into(), target_label(spec, &resolved.label));
                     at
                 }
@@ -357,8 +377,20 @@ async fn click(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 (None, None) => unreachable!(),
             };
             let held = actions::with_modifiers(input, &modifiers).await?;
+            let seq = c.page.event_seq();
+            let url_before = c.page.main_url();
             input.click(at, &button, count).await?;
             actions::release_modifiers(input, &held).await?;
+            // A link's navigation often starts after the short aftermath wait, or only changes the URL
+            // inside the same document. Wait until that shows up so the result names the page it opened.
+            if follow {
+                let _ = c.page.wait_until(Duration::from_millis(1_500), Duration::from_millis(50), |page| {
+                    page.dialog().is_some()
+                        || page.main_url() != url_before
+                        || page.events_since(seq).iter().any(|event| matches!(event, TabEvent::NavigationStarted { .. } | TabEvent::Navigated { .. }))
+                })
+                .await;
+            }
             Ok(out)
         })
     })
@@ -1535,8 +1567,8 @@ fn snapshot_schema() -> Value {
         props(json!({
             "within": { "type": "string", "description": "A ref (\"e12\") or selector to snapshot only that part. A selector with several matches uses the first visible one, with no match the whole page; either adds a note." },
             "interactive": { "type": "boolean", "description": "Only controls (and alerts), no headings or paragraphs." },
-            "compact": { "type": "boolean", "description": "Collapse navigation, layout tables and redundant headings (default true)." },
-            "find": { "type": "string", "description": "Only lines containing this text (case-insensitive), or matching /regex/flags, with context lines around them." },
+            "compact": { "type": "boolean", "description": "Collapse navigation, layout tables and redundant headings (default true). Pass false or --no-compact to keep them." },
+            "find": { "type": "string", "description": "Only lines containing this text (case-insensitive), or matching /regex/flags, with context lines around them. The search looks through the page first, then returns the matches, so text past the maxItems outline is still found. A pattern with | is literal text unless it is wrapped as /regex/flags." },
             "context": { "type": "integer", "description": "Context lines around find matches (0-10, default 2)." },
             "diff": { "type": "boolean", "description": "Only +added / -removed lines versus the previous snapshot (same tab and options required)." },
             "delta": { "type": "boolean", "description": "Like diff when a compatible previous snapshot exists, else a full snapshot." },
@@ -1551,7 +1583,7 @@ fn snapshot_schema() -> Value {
     )
 }
 
-const CLICK: &str = "Click an element (or x/y in page CSS pixels). Waits until it is visible, enabled and not moving, scrolls it into view and checks nothing covers it: a covered target fails fast naming the element on top (dismiss it, or pass force). Returns JSON: clicked, url, and what changed: navigated/title, urlChanged, dialog (the page is paused until you call dialog), newTabs, challenge/warning.";
+const CLICK: &str = "Click an element (or x/y in page CSS pixels). Waits until it is visible, enabled and not moving, scrolls it into view and checks nothing covers it: a covered target fails fast naming the element on top (dismiss it, or pass force). A click on a link waits for the navigation or the URL change (including a same-document one) and returns that page. Returns JSON: clicked, url, and what changed: navigated/title, urlChanged, dialog (the page is paused until you call dialog), newTabs, challenge/warning. A CSS href selector matches the attribute text, not the resolved URL: a relative href does not match an absolute one.";
 
 fn click_schema() -> Value {
     let mut p = target_props(props(json!({

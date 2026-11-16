@@ -140,12 +140,21 @@ pub struct ResolveOptions {
     pub act: bool,
 }
 
+/// CSS `href="https://..."` matches the attribute text. Pages often store a relative path, so an absolute URL matches nothing.
+fn href_hint(selector: &str) -> &'static str {
+    if selector.contains("href=") && selector.contains("://") {
+        "\nA CSS href selector matches the attribute as written. A relative href does not match an absolute URL; match the path, or use *=."
+    } else {
+        ""
+    }
+}
+
 fn selector_error(selector: &str, status: &str) -> Option<anyhow::Error> {
     let rest = status.strip_prefix("multiple:")?;
     let (count, previews) = rest.split_once(':').unwrap_or((rest, ""));
     let shown: Vec<String> = previews.lines().map(|line| format!("  {line}")).collect();
     Some(anyhow!(
-        "Selector {selector:?} matches {count} elements; it must match one. Make it more specific (a role and name, an id, or `>> nth=0` for the first):\n{}",
+        "Selector `{selector}` matches {count} elements; it must match one. Make it more specific (a role and name, an id, or `>> nth=0` for the first):\n{}",
         shown.join("\n")
     ))
 }
@@ -319,14 +328,14 @@ async fn wait_query(page: &Arc<TabPage>, frame: &str, part: &str, full: &str, de
                 if message.contains("navigated or re-rendered") {
                     // Keep waiting through a navigation.
                 } else if is_selector_error(&message) {
-                    bail!("Invalid selector {full:?}: {message}");
+                    bail!("Invalid selector `{full}`: {message}");
                 } else {
                     return Err(error);
                 }
             }
         }
         if Instant::now() >= deadline {
-            bail!("No element matches selector {full:?} (waited {} ms)", timeout.as_millis());
+            bail!("No element matches selector `{full}` (waited {} ms){}", timeout.as_millis(), href_hint(full));
         }
         tokio::time::sleep(POLL).await;
     }
@@ -353,6 +362,13 @@ mod tests {
         assert_eq!(normalize_selector("form >> placeholder=\"Search\"s"), "form >> internal:attr=[placeholder=\"Search\"s]");
         assert_eq!(normalize_selector("testid=save"), "internal:testid=[data-testid=\"save\"s]");
         assert_eq!(normalize_selector("role=button[name=\"Save\"]"), "role=button[name=\"Save\"]");
+    }
+
+    #[test]
+    fn absolute_href_hint() {
+        assert!(href_hint("a[href=\"https://www.espn.com/nfl/team\"]").contains("relative href"));
+        assert_eq!(href_hint("a[href*=\"pittsburgh-steelers\"]"), "");
+        assert_eq!(href_hint("role=link[name=\"NFL\"]"), "");
     }
 
     #[test]
